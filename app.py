@@ -1,6 +1,9 @@
 import os
-import pyaudio
-import wave
+# import pyaudio
+# import wave
+import numpy as np
+import sounddevice as sd
+from scipy.io.wavfile import write
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -13,7 +16,7 @@ load_dotenv()
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 genai.configure(api_key=os.getenv("Gemini_API_Key"))
 
-
+print(sd.query_devices())
 app = Flask(__name__, static_folder="build")
 CORS(app) 
 
@@ -27,8 +30,6 @@ def static_proxy(path):
 
 # Global variables to control recording state
 is_recording = False
-frames = []
-
 prompts = {
     "part_1": [
         "Can you tell me about yourself?",
@@ -46,7 +47,8 @@ prompts = {
         "What is the importance of leisure activities in a busy lifestyle?"
     ]
 }
-
+frames = []
+samplerate = 16000
 # Track test progress (simplified; can be enhanced with a database)
 test_progress = {}
 
@@ -94,25 +96,67 @@ def next_question():
     question = prompts[section][question_index]
     return jsonify({"section": section, "question": question})
 
+selected_device = None  # To store the selected microphone device
+
+
+def list_microphones():
+    """List all available audio input devices."""
+    devices = sd.query_devices()
+    input_devices = [
+        {"id": i, "name": d["name"]}
+        for i, d in enumerate(devices) if d["max_input_channels"] > 0
+    ]
+    return input_devices
+
+
+@app.route('/api/microphones', methods=['GET'])
+def get_microphones():
+    """API to fetch the list of available microphones."""
+    return jsonify(list_microphones())
+
+
+@app.route('/api/select-microphone', methods=['POST'])
+def select_microphone():
+    """API to select a specific microphone by its device ID."""
+    global selected_device
+    data = request.json
+    device_id = data.get("device_id")
+
+    # Validate device ID
+    devices = list_microphones()
+    if any(device["id"] == device_id for device in devices):
+        selected_device = device_id
+        return jsonify({"message": f"Microphone {device_id} selected"})
+    else:
+        return jsonify({"error": "Invalid device ID"}), 400
+
 @app.route('/api/start-record', methods=['POST'])
 def start_record():
     global is_recording, frames
     is_recording = True
-    frames = []
 
     # Start recording in a separate thread
     def record():
         global is_recording, frames
-        p = pyaudio.PyAudio()
-        stream = p.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1024)
+        samplerate = 16000  # Sample rate
+        blocksize = 1024
+        frames = []
+        def callback(indata, frames_count, time, status):
+            if is_recording:
+                frames.append(indata.copy())
 
-        while is_recording:
-            data = stream.read(1024)
-            frames.append(data)
+        # Open the input stream using sounddevice
+        with sd.InputStream(
+            samplerate=samplerate,
+            channels=1,
+            dtype='int16',
+            callback=callback,
+            blocksize=1024,
+            device=selected_device
+        ):
+            while is_recording:
+                sd.sleep(100)  # Keep the thread alive while recording
 
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
 
     thread = Thread(target=record)
     thread.start()
@@ -126,13 +170,12 @@ def stop_record():
 
     # Save audio to a .wav file
     filename = "audio.wav"
-    with wave.open(filename, 'wb') as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(pyaudio.PyAudio().get_sample_size(pyaudio.paInt16))
-        wf.setframerate(16000)
-        wf.writeframes(b''.join(frames))
+    frames_array = np.concatenate(frames, axis=0)  # Convert list of numpy arrays to bytes
+
+    write(filename, samplerate, frames_array.astype(np.int16))
 
     return jsonify({"message": "Recording stopped", "filename": filename})
+
 
 def transcribe_audio(filename):
     client = speech.SpeechClient()
